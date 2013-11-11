@@ -132,7 +132,7 @@ class ConnectionRouter(object):
                 connection_to_use = action_callable(**hints)
 
                 if connection_to_use is not None:
-                    return connection_to_use
+                    conns.append(connection_to_use)
 
         # If we didn't find a router to handle it, use the default.
         return DEFAULT_ALIAS
