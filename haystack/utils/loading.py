@@ -126,6 +126,8 @@ class ConnectionRouter(object):
             self.routers.append(router_class())
 
     def for_action(self, action, **hints):
+        conns = []
+
         for router in self.routers:
             if hasattr(router, action):
                 action_callable = getattr(router, action)
@@ -134,8 +136,7 @@ class ConnectionRouter(object):
                 if connection_to_use is not None:
                     conns.append(connection_to_use)
 
-        # If we didn't find a router to handle it, use the default.
-        return DEFAULT_ALIAS
+        return conns
 
     def for_write(self, **hints):
         return self.for_action('for_write', **hints)
