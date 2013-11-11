@@ -1,13 +1,16 @@
-from __future__ import unicode_literals
 import copy
 import inspect
+import threading
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.utils.datastructures import SortedDict
-from django.utils import importlib
 from django.utils.module_loading import module_has_submodule
 from haystack.constants import Indexable, DEFAULT_ALIAS
 from haystack.exceptions import NotHandled, SearchFieldError
+try:
+    from django.utils import importlib
+except ImportError:
+    from haystack.utils import importlib
 
 
 def import_class(path):
@@ -123,17 +126,16 @@ class ConnectionRouter(object):
             self.routers.append(router_class())
 
     def for_action(self, action, **hints):
-        conns = []
-
         for router in self.routers:
             if hasattr(router, action):
                 action_callable = getattr(router, action)
                 connection_to_use = action_callable(**hints)
 
                 if connection_to_use is not None:
-                    conns.append(connection_to_use)
+                    return connection_to_use
 
-        return conns
+        # If we didn't find a router to handle it, use the default.
+        return DEFAULT_ALIAS
 
     def for_write(self, **hints):
         return self.for_action('for_write', **hints)
@@ -147,7 +149,9 @@ class UnifiedIndex(object):
     def __init__(self, excluded_indexes=None):
         self.indexes = {}
         self.fields = SortedDict()
+        self._build_lock = threading.RLock()
         self._built = False
+        self._indexes_setup = False
         self.excluded_indexes = excluded_indexes or []
         self.excluded_indexes_ids = {}
         self.document_field = getattr(settings, 'HAYSTACK_DOCUMENT_FIELD', 'text')
@@ -189,6 +193,22 @@ class UnifiedIndex(object):
         self._facet_fieldnames = {}
 
     def build(self, indexes=None):
+        """
+        Build/rebuild the index data. This class is not thread-safe when
+        indexes are passed into this method, because it will trigger reset()
+        and that clears a bunch of data that other threads might be using.
+
+        Luckily, web requests never call this passing in indexes, so there
+        is no need to lock down access to every piece of data on this class.
+        Only tests and management commands are not thread-safe, and they don't
+        use threads.
+
+        """
+        with self._build_lock:
+            if not self._built or indexes is not None:
+                self._build(indexes=indexes)
+
+    def _build(self, indexes=None):
         self.reset()
 
         if indexes is None:
@@ -198,13 +218,7 @@ class UnifiedIndex(object):
             model = index.get_model()
 
             if model in self.indexes:
-                raise ImproperlyConfigured(
-                    "Model '%s' has more than one 'SearchIndex`` handling it. "
-                    "Please exclude either '%s' or '%s' using the 'EXCLUDED_INDEXES' "
-                    "setting defined in 'settings.HAYSTACK_CONNECTIONS'." % (
-                        model, self.indexes[model], index
-                    )
-                )
+                raise ImproperlyConfigured("Model '%s' has more than one 'SearchIndex`` handling it. Please exclude either '%s' or '%s' using the 'HAYSTACK_EXCLUDED_INDEXES' setting." % (model, self.indexes[model], index))
 
             self.indexes[model] = index
             self.collect_fields(index)
@@ -267,11 +281,34 @@ class UnifiedIndex(object):
                 if field_object.null is True:
                     self.fields[field_object.index_fieldname].null = True
 
+    def setup_indexes(self):
+        if not self._built:
+            self.build()
+
+        if self._indexes_setup:
+            return
+
+        for model_ct, index in self.indexes.items():
+            index._setup_save()
+            index._setup_delete()
+
+        self._indexes_setup = True
+
+    def teardown_indexes(self):
+        if not self._built:
+            self.build()
+
+        for model_ct, index in self.indexes.items():
+            index._teardown_save()
+            index._teardown_delete()
+
+        self._indexes_setup = False
+
     def get_indexed_models(self):
         if not self._built:
             self.build()
 
-        return list(self.indexes.keys())
+        return self.indexes.keys()
 
     def get_index_fieldname(self, field):
         if not self._built:
@@ -311,3 +348,4 @@ class UnifiedIndex(object):
             self.build()
 
         return self.fields
+
